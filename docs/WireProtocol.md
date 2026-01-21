@@ -254,6 +254,231 @@ Control messages are sent between components and rtrouted to manage subscription
 4. Router forwards matching messages to component
 5. Component sends unsubscribe before disconnecting
 
+### 5.3 Discovery Messages
+
+Discovery messages allow components to query the router's routing table to discover registered elements and components.
+
+#### 5.3.1 Query Wildcard Destinations
+
+Resolves partial paths to discover matching registered topics.
+
+**RTMessage Envelope:**
+- Topic: `_RTROUTED.INBOX.QUERY`
+- Flags: 0x01 (Request)
+- Payload Encoding: JSON (RFC 8259)
+
+**Request JSON Format:**
+```json
+{
+  "expression": "Device.WiFi."
+}
+```
+
+**Response JSON Format:**
+```json
+{
+  "result": 0,
+  "count": 3,
+  "items": [
+    "Device.WiFi.SSID",
+    "Device.WiFi.Enable", 
+    "Device.WiFi.AccessPoint."
+  ]
+}
+```
+
+**Field Definitions:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| expression | string | Partial path or wildcard pattern |
+| result | integer | Status code (0=success) |
+| count | integer | Number of matching topics |
+| items | array of strings | List of matching topic paths |
+
+**Use Case:** Used when a component needs to discover what elements are registered under a partial path (e.g., "Device.WiFi." returns all WiFi-related topics).
+
+#### 5.3.2 Discover Object Elements
+
+Enumerates all topics registered for a specific route/component.
+
+**RTMessage Envelope:**
+- Topic: `_enumerate_elements`
+- Flags: 0x01 (Request)
+- Payload Encoding: JSON (RFC 8259)
+
+**Request JSON Format:**
+```json
+{
+  "expression": "Device.WiFi.SSID"
+}
+```
+
+**Response JSON Format:**
+```json
+{
+  "count": 5,
+  "items": [
+    "Device.WiFi.SSID",
+    "Device.WiFi.Enable",
+    "Device.WiFi.Channel",
+    "Device.WiFi.Standard",
+    "Device.WiFi.AccessPoint."
+  ]
+}
+```
+
+**Field Definitions:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| expression | string | Exact route expression to query |
+| count | integer | Number of elements on this route |
+| items | array of strings | Full topic names registered to this route |
+
+#### 5.3.3 Discover Element Objects
+
+Reverse lookup: finds which route owns a specific topic.
+
+**RTMessage Envelope:**
+- Topic: `_trace_origin_object`
+- Flags: 0x01 (Request)
+- Payload Encoding: JSON (RFC 8259)
+
+**Request JSON Format:**
+```json
+{
+  "expression": "Device.WiFi.SSID"
+}
+```
+
+**Response JSON Format:**
+```json
+{
+  "count": 1,
+  "items": [
+    "Device.WiFi."
+  ]
+}
+```
+
+**Use Case:** Determines which provider component owns a specific element path.
+
+#### 5.3.4 Discover Registered Components
+
+Lists all active component routes registered with the router.
+
+**RTMessage Envelope:**
+- Topic: `_registered_components`
+- Flags: 0x01 (Request)
+- Payload Encoding: JSON (RFC 8259)
+
+**Request JSON Format:**
+```json
+{}
+```
+
+**Response JSON Format:**
+```json
+{
+  "count": 4,
+  "items": [
+    "Device.WiFi.",
+    "Device.DeviceInfo.",
+    "Device.Logging.",
+    "Device.Time."
+  ]
+}
+```
+
+**Field Definitions:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| count | integer | Number of registered routes |
+| items | array of strings | List of route expressions (excludes internal "_" prefixed routes) |
+
+**Note:** This only returns non-internal routes. Routes starting with "_" (router control topics) are filtered out.
+
+### 5.4 Advisory Messages
+
+Advisory messages are broadcast by rtrouted to notify subscribers about client connection lifecycle events.
+
+**RTMessage Envelope:**
+- Topic: `_RTROUTED.ADVISORY`
+- Flags: 0x00 (no flags)
+- Payload Encoding: JSON (RFC 8259)
+
+**Advisory Event Format:**
+```json
+{
+  "event": 0,
+  "inbox": "rbus.component.INBOX.12345"
+}
+```
+
+**Field Definitions:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| event | integer | Event type (0=connect, 1=disconnect) |
+| inbox | string | Inbox topic of the connecting/disconnecting client |
+
+**Event Types:**
+
+| Value | Name | Description |
+|-------|------|-------------|
+| 0 | rtAdviseClientConnect | Component connected and registered inbox |
+| 1 | rtAdviseClientDisconnect | Component disconnected |
+
+**Use Case:** Components can subscribe to `_RTROUTED.ADVISORY` to monitor when other components join or leave the bus. This is useful for service discovery and graceful degradation.
+
+### 5.5 Diagnostic Messages
+
+Diagnostic messages allow administrators to query router state and enable debugging features.
+
+**RTMessage Envelope:**
+- Topic: `_RTROUTED.INBOX.DIAG`
+- Flags: 0x01 (Request)
+- Payload Encoding: JSON (RFC 8259)
+
+**Diagnostic Commands:**
+
+| Command | Description |
+|---------|-------------|
+| `enableVerboseLogs` | Enable verbose logging in rtrouted |
+| `disableVerboseLogs` | Disable verbose logging |
+| `logRoutingStats` | Dump routing statistics to logs |
+| `logRoutingTopics` | List all registered topics |
+| `logRoutingRoutes` | List all active routes |
+| `enableTrafficMonitor` | Enable message traffic monitoring |
+| `disableTrafficMonitor` | Disable traffic monitoring |
+| `resetBenchmarkData` | Clear performance benchmark counters |
+| `dumpBenchmarkData` | Output benchmark data to logs |
+| `heartbeat` | Check if router is responsive |
+| `shutdown` | Gracefully shut down router |
+
+**Request Format (example):**
+```json
+{
+  "_RTROUTED.INBOX.DIAG.KEY": "logRoutingStats"
+}
+```
+
+**Note:** Diagnostic messages are intended for debugging and administrative purposes only. Production code should not rely on these messages.
+
+### 5.6 Router Control Topic Summary
+
+| Topic | Purpose | Request | Response |
+|-------|---------|---------|----------|
+| `_RTROUTED.INBOX.SUBSCRIBE` | Manage subscriptions | JSON | JSON |
+| `_RTROUTED.INBOX.QUERY` | Discover wildcard destinations | JSON | JSON |
+| `_enumerate_elements` | List route elements | JSON | JSON |
+| `_trace_origin_object` | Reverse route lookup | JSON | JSON |
+| `_registered_components` | List active components | JSON | JSON |
+| `_RTROUTED.ADVISORY` | Connection lifecycle events | N/A | JSON (broadcast) |
+| `_RTROUTED.INBOX.DIAG` | Diagnostic commands | JSON | Varies |
+
 ---
 
 ## 6. RBus Application Messages
@@ -1297,6 +1522,85 @@ The Encrypted flag (0x20) is defined but:
    Reply Topic: ""
    Flags: 0x12 (Response + RawBinary)
    Payload: [Get Parameter Names Response]
+```
+
+#### 10.2.6 Wildcard Query Discovery Flow
+
+```
+1. Consumer → Router (RTMessage - Control)
+   Topic: "_RTROUTED.INBOX.QUERY"
+   Reply Topic: "rbus.consumer.INBOX.005"
+   Flags: 0x01 (Request, JSON payload)
+   Payload: {"expression": "Device.WiFi."}
+
+2. Router resolves partial path in routing tree
+
+3. Router → Consumer (RTMessage - Control)
+   Topic: "rbus.consumer.INBOX.005"
+   Reply Topic: ""
+   Flags: 0x02 (Response, JSON payload)
+   Payload: {
+     "result": 0,
+     "count": 3,
+     "items": [
+       "Device.WiFi.SSID",
+       "Device.WiFi.Enable",
+       "Device.WiFi.AccessPoint."
+     ]
+   }
+```
+
+#### 10.2.7 Component Discovery Flow
+
+```
+1. Consumer → Router (RTMessage - Control)
+   Topic: "_registered_components"
+   Reply Topic: "rbus.consumer.INBOX.006"
+   Flags: 0x01 (Request, JSON payload)
+   Payload: {}
+
+2. Router enumerates all active routes
+
+3. Router → Consumer (RTMessage - Control)
+   Topic: "rbus.consumer.INBOX.006"
+   Reply Topic: ""
+   Flags: 0x02 (Response, JSON payload)
+   Payload: {
+     "count": 4,
+     "items": [
+       "Device.WiFi.",
+       "Device.DeviceInfo.",
+       "Device.Logging.",
+       "Device.Time."
+     ]
+   }
+```
+
+#### 10.2.8 Advisory Notification Flow
+
+```
+1. New Component → Router (establishes connection)
+
+2. New Component → Router (RTMessage - Control)
+   Topic: "_RTROUTED.INBOX.SUBSCRIBE"
+   Flags: 0x01 (Request)
+   Payload: {
+     "add": 1,
+     "topic": "rbus.newcomponent.INBOX.001",
+     "route_id": 1
+   }
+
+3. Router → All Advisory Subscribers (RTMessage - Broadcast)
+   Topic: "_RTROUTED.ADVISORY"
+   Flags: 0x00 (no flags)
+   Payload: {
+     "event": 0,
+     "inbox": "rbus.newcomponent.INBOX.001"
+   }
+
+Note: Advisory messages are broadcast to all components subscribed
+to _RTROUTED.ADVISORY topic. This allows components to monitor
+the connection/disconnection of other components.
 ```
 
 ### 10.3 Compliance Checklist
