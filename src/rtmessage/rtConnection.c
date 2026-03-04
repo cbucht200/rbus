@@ -32,6 +32,7 @@
 #include "rtTime.h"
 #include "rtSemaphore.h"
 #include "rtMemory.h"
+#include <limits.h>
 #include <dlfcn.h>
 
 #if defined(__GNUC__)                                                          \
@@ -229,9 +230,9 @@ static rtError rtConnection_SendInternal(
   char const* reply_topic,
   int flags,
   uint32_t sequence_number,
-  uint32_t T1,
-  uint32_t T2,
-  uint32_t T3);
+  uint64_t T1,
+  uint64_t T2,
+  uint64_t T3);
 
 rtError
 rtConnection_SendRequestInternal(
@@ -514,12 +515,69 @@ rtConnection_ReadUntil(rtConnection con, uint8_t* buff, int count, int32_t timeo
   return RT_OK;
 }
 
+/*
+ * rtConnection_DestroyOnCleanup
+ *
+ * Cleans up and frees all resources associated with the rtConnection object.
+ * Destroys mutexes and condition variables if initialized.
+ * Destroys the mutex attribute if provided.
+ *
+ * Parameters:
+ *   c                   - Pointer to the rtConnection object to clean up
+ *   mutex_init          - true if main mutex was initialized
+ *   callback_mutex_init - true if callback mutex was initialized
+ *   reconnect_mutex_init - true if reconnect mutex was initialized
+ *   cond_init           - true if condition variable was initialized
+ *   mutex_attr_init     - true if mutex_attribute was initialized
+ *   mutex_attr_ptr      - pointer to mutex attribute to destroy (if not NULL)
+ */
+static void
+rtConnection_DestroyOnCleanup(rtConnection c, bool mutex_init, bool callback_mutex_init, bool reconnect_mutex_init, bool cond_init, bool mutex_attr_init, pthread_mutexattr_t* mutex_attr_ptr)
+{
+    if (c)
+    {
+      if (c->send_buffer)
+      {
+        free(c->send_buffer);
+      }
+      if (c->recv_buffer)
+      {
+        free(c->recv_buffer);
+      }
+      if (c->application_name)
+      {
+        free(c->application_name);
+      }
+      if (c->pending_requests_list)
+      {
+        rtList_Destroy(c->pending_requests_list, NULL);
+      }
+      if (c->callback_message_list)
+      {
+        rtList_Destroy(c->callback_message_list, NULL);
+      }
+      if (mutex_init)
+        pthread_mutex_destroy(&c->mutex);
+      if (callback_mutex_init)
+        pthread_mutex_destroy(&c->callback_message_mutex);
+      if (reconnect_mutex_init)
+        pthread_mutex_destroy(&c->reconnect_mutex);
+      if (cond_init)
+        pthread_cond_destroy(&c->callback_message_cond);
+      if (mutex_attr_init && mutex_attr_ptr)
+        pthread_mutexattr_destroy(mutex_attr_ptr);
+      free(c);
+    }
+}
 
 static rtError
 rtConnection_CreateInternal(rtConnection* con, char const* application_name, char const* router_config, int max_retries)
 {
   int i = 0;
   rtError err = RT_OK;
+
+  bool mutex_init = false, callback_mutex_init = false, reconnect_mutex_init = false, cond_init = false;
+  bool mutex_attr_init = false;
 
   rtConnection c = (rtConnection) rt_try_malloc(sizeof(struct _rtConnection));
   if (!c)
@@ -528,17 +586,31 @@ rtConnection_CreateInternal(rtConnection* con, char const* application_name, cha
   memset(c, 0, sizeof(struct _rtConnection));
 
   pthread_mutexattr_t mutex_attribute;
-  pthread_mutexattr_init(&mutex_attribute);
-  pthread_mutexattr_settype(&mutex_attribute, PTHREAD_MUTEX_ERRORCHECK);
-  if (0 != pthread_mutex_init(&c->mutex, &mutex_attribute) ||
-      0 != pthread_mutex_init(&c->callback_message_mutex, &mutex_attribute) ||
-      0 != pthread_mutex_init(&c->reconnect_mutex, &mutex_attribute))
+  if (pthread_mutexattr_init(&mutex_attribute) == 0)
   {
-    rtLog_Error("Could not initialize mutex. Cannot create connection.");
-    free(c);
+    mutex_attr_init = true;
+    pthread_mutexattr_settype(&mutex_attribute, PTHREAD_MUTEX_ERRORCHECK);
+  }
+
+  if (mutex_attr_init)
+  {
+    if (0 == pthread_mutex_init(&c->mutex, &mutex_attribute))
+      mutex_init = true;
+    if (0 == pthread_mutex_init(&c->callback_message_mutex, &mutex_attribute))
+      callback_mutex_init = true;
+    if (0 == pthread_mutex_init(&c->reconnect_mutex, &mutex_attribute))
+      reconnect_mutex_init = true;
+  }
+  if (0 == pthread_cond_init(&c->callback_message_cond, NULL))
+    cond_init = true;
+
+  if (!(mutex_attr_init && mutex_init && callback_mutex_init && reconnect_mutex_init && cond_init))
+  {
+    rtLog_Error("Could not initialize mutex or mutex attribute. Cannot create connection.");
+    rtConnection_DestroyOnCleanup(c, mutex_init, callback_mutex_init, reconnect_mutex_init, cond_init, mutex_attr_init, &mutex_attribute);
     return RT_ERROR;
   }
-  pthread_cond_init(&c->callback_message_cond, NULL);
+
   for (i = 0; i < RTMSG_LISTENERS_MAX; ++i)
   {
     c->listeners[i].in_use = 0;
@@ -549,10 +621,16 @@ rtConnection_CreateInternal(rtConnection* con, char const* application_name, cha
   c->send_buffer_in_use = 0;
   c->send_buffer = (uint8_t *) rt_try_malloc(RTMSG_SEND_BUFFER_SIZE);
   if(!c->send_buffer)
+  {
+    rtConnection_DestroyOnCleanup(c, mutex_init, callback_mutex_init, reconnect_mutex_init, cond_init, mutex_attr_init, &mutex_attribute);
     return rtErrorFromErrno(ENOMEM);
+  }
   c->recv_buffer = (uint8_t *) rt_try_malloc(RTMSG_SEND_BUFFER_SIZE);
   if(!c->recv_buffer)
+  {
+    rtConnection_DestroyOnCleanup(c, mutex_init, callback_mutex_init, reconnect_mutex_init, cond_init, mutex_attr_init, &mutex_attribute);
     return rtErrorFromErrno(ENOMEM);
+  }
   c->recv_buffer_capacity = RTMSG_SEND_BUFFER_SIZE;
   c->sequence_number = 1;
 #ifdef C11_ATOMICS_SUPPORTED
@@ -586,25 +664,15 @@ rtConnection_CreateInternal(rtConnection* con, char const* application_name, cha
   if (err != RT_OK)
   {
     rtLog_Warn("failed to parse:%s. %s", router_config, rtStrError(err));
-    free(c->send_buffer);
-    free(c->recv_buffer);
-    free(c->application_name);
-    rtList_Destroy(c->pending_requests_list,NULL);
-    rtList_Destroy(c->callback_message_list, NULL);
-    free(c);
+    rtConnection_DestroyOnCleanup(c, mutex_init, callback_mutex_init, reconnect_mutex_init, cond_init, mutex_attr_init, &mutex_attribute);
     return err;
   }
   err = rtConnection_ConnectAndRegister(c, 0);
   if (err != RT_OK)
   {
-    // TODO: at least log this
     rtLog_Warn("rtConnection_ConnectAndRegister(1):%d", err);
-    free(c->send_buffer);
-    free(c->recv_buffer);
-    free(c->application_name);
-    rtList_Destroy(c->pending_requests_list,NULL);
-    rtList_Destroy(c->callback_message_list, NULL);
-    free(c);
+    rtConnection_DestroyOnCleanup(c, mutex_init, callback_mutex_init, reconnect_mutex_init, cond_init, mutex_attr_init, &mutex_attribute);
+    return err;
   }
 
   if (err == RT_OK)
@@ -614,6 +682,8 @@ rtConnection_CreateInternal(rtConnection* con, char const* application_name, cha
     *con = c;
   }
 
+  if (mutex_attr_init)
+    pthread_mutexattr_destroy(&mutex_attribute);
   return err;
 }
 
@@ -708,12 +778,6 @@ rtConnection_Destroy(rtConnection con)
 
     if (con->fd != -1)
       close(con->fd);
-    if (con->send_buffer)
-      free(con->send_buffer);
-    if (con->recv_buffer)
-      free(con->recv_buffer);
-    if (con->application_name)
-      free(con->application_name);
 #ifdef WITH_SPAKE2
     if (con->cipher)
       rtCipher_Destroy(con->cipher);
@@ -743,7 +807,9 @@ rtConnection_Destroy(rtConnection con)
       rtSemaphore_Post(entry->sem);
     }
     rtList_Destroy(con->pending_requests_list,NULL);
+    con->pending_requests_list = NULL;
     rtList_Destroy(con->callback_message_list, rtMessageInfo_ListItemFree);
+    con->callback_message_list = NULL;
     pthread_mutex_unlock(&con->mutex);
     if(0 != found_pending_requests)
     {
@@ -751,13 +817,7 @@ rtConnection_Destroy(rtConnection con)
       sleep(1); /* ugly hack to allow all sendRequest() calls to return and stop using con->* data members. Hopefully, this will never be
       executed in practice. Revisit if necessary. */
     }
-
-    pthread_mutex_destroy(&con->mutex);
-    pthread_mutex_destroy(&con->callback_message_mutex);
-    pthread_cond_destroy(&con->callback_message_cond);
-    pthread_mutex_destroy(&con->reconnect_mutex);
-
-    free(con);
+    rtConnection_DestroyOnCleanup(con, true, true, true, true, false, NULL);
   }
   return 0;
 }
@@ -848,7 +908,11 @@ rtConnection_SendResponse(rtConnection con, rtMessageHeader const* request_hdr, 
     rtMessage_ToByteArrayWithSize(res, &p, DEFAULT_SEND_BUFFER_SIZE, &n);
     pthread_mutex_lock(&con->mutex);
   //TODO: should we send response on reconnect ?
+    #ifdef MSG_ROUNDTRIP_TIME
+    err = rtConnection_SendInternal(con, p, n, request_hdr->reply_topic, request_hdr->topic, rtMessageFlags_Response, request_hdr->sequence_number, request_hdr->T1, request_hdr->T2, request_hdr->T3);
+    #else
     err = rtConnection_SendInternal(con, p, n, request_hdr->reply_topic, request_hdr->topic, rtMessageFlags_Response, request_hdr->sequence_number, 0, 0, 0);
+    #endif
     pthread_mutex_unlock(&con->mutex);
     rtMessage_FreeByteArray(p);
 
@@ -1109,7 +1173,7 @@ dequeue_and_continue:
 
 rtError
 rtConnection_SendInternal(rtConnection con, uint8_t const* buff, uint32_t n, char const* topic,
-  char const* reply_topic, int flags, uint32_t sequence_number, uint32_t T1, uint32_t T2, uint32_t T3)
+  char const* reply_topic, int flags, uint32_t sequence_number, uint64_t T1, uint64_t T2, uint64_t T3)
 {
   rtError err;
   int num_attempts;
@@ -1173,14 +1237,14 @@ rtConnection_SendInternal(rtConnection con, uint8_t const* buff, uint32_t n, cha
 #ifdef MSG_ROUNDTRIP_TIME
   if(header.flags & rtMessageFlags_Request)
   {
-       header.T1 = send_time.tv_sec;
+       header.T1 = (uint64_t)send_time.tv_sec * 1000000000LL + send_time.tv_nsec;
   }
   if(header.flags & rtMessageFlags_Response)
   {
        header.T1 = T1;
        header.T2 = T2;
        header.T3 = T3;
-       header.T4 = send_time.tv_sec;
+       header.T4 = (uint64_t)send_time.tv_sec * 1000000000LL + send_time.tv_nsec;
   }
 #else
   (void)T1;
@@ -1539,18 +1603,36 @@ rtConnection_Read(rtConnection con, int32_t timeout)
 
     if (err == RT_OK)
     {
+      if (msginfo->header.payload_length > (uint32_t)INT_MAX)
+      {
+        rtLog_Error("Payload length too large: %u", msginfo->header.payload_length);
+        rtMessageInfo_Release(msginfo);
+        return RT_NO_CONNECTION;
+      }
       if(msginfo->dataCapacity < msginfo->header.payload_length + 1)
       {
-        msginfo->data = (uint8_t *)rt_try_malloc(msginfo->header.payload_length + 1);
+        size_t alloc_size = (size_t)msginfo->header.payload_length + 1;
+        msginfo->data = (uint8_t *)rt_try_malloc(alloc_size);
         if(!msginfo->data){
           rtLog_Error("Failed to allocate memory for msginfo->data");
           rtMessageInfo_Release(msginfo);
           return rtErrorFromErrno(ENOMEM);
         }
-        msginfo->dataCapacity = msginfo->header.payload_length + 1;
+
+        /* Protect against truncation when casting size_t to uint32_t. */
+        if (alloc_size > (size_t)UINT32_MAX)
+        {
+          rtLog_Error("Requested allocation is too large: %zu", alloc_size);
+          free(msginfo->data);
+          msginfo->data = NULL;
+
+          rtMessageInfo_Release(msginfo);
+          return RT_NO_CONNECTION;
+        }
+        msginfo->dataCapacity = (uint32_t)alloc_size;
       }
 
-      err = rtConnection_ReadUntil(con, msginfo->data, msginfo->header.payload_length, timeout);
+      err = rtConnection_ReadUntil(con, msginfo->data, (int)msginfo->header.payload_length, timeout);
 
       if (err == RT_OK)
       {
@@ -1629,11 +1711,11 @@ rtConnection_Read(rtConnection con, int32_t timeout)
       {
         rtMessage m;
         rtMessage_Create(&m);
-        rtMessage_SetInt32(m, "T1", msginfo->header.T1);
-        rtMessage_SetInt32(m, "T2", msginfo->header.T2);
-        rtMessage_SetInt32(m, "T3", msginfo->header.T3);
-        rtMessage_SetInt32(m, "T4", msginfo->header.T4);
-        rtMessage_SetInt32(m, "T5", msginfo->header.T5);
+        rtMessage_SetUInt64(m, "T1", msginfo->header.T1);
+        rtMessage_SetUInt64(m, "T2", msginfo->header.T2);
+        rtMessage_SetUInt64(m, "T3", msginfo->header.T3);
+        rtMessage_SetUInt64(m, "T4", msginfo->header.T4);
+        rtMessage_SetUInt64(m, "T5", msginfo->header.T5);
         rtMessage_SetString(m, "topic", msginfo->header.topic);
         rtMessage_SetString(m, "reply_topic", msginfo->header.reply_topic);
         rtConnection_SendMessage(con, m, RTROUTED_TRANSACTION_TIME_INFO);
@@ -1776,14 +1858,17 @@ static void * rtConnection_CallbackThread(void *data)
     }
 
     rtList_GetSize(con->callback_message_list, &size);
-
-    if (size == 0)
+    while (size == 0)
     {
-      //rtLog_Error("Callback thread before wait");
       pthread_cond_wait(&con->callback_message_cond, &con->callback_message_mutex);
-      //rtLog_Error("Callback thread after wait");
+      if (GetRunThreadsSync(con) == 0)
+      {
+        pthread_mutex_unlock(&con->callback_message_mutex);
+        rtLog_Debug("Callback thread exiting");
+        return NULL;
+      }
+      rtList_GetSize(con->callback_message_list, &size);
     }
-
     /*get first item to handle*/
     rtList_GetFront(con->callback_message_list, &listItem);
 
