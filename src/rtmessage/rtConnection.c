@@ -1124,11 +1124,10 @@ rtConnection_SendRequestInternal(rtConnection con, uint8_t const* pReq, uint32_t
         }
       } while(RT_OK == err);
     }
+      
+    pthread_mutex_lock(&con->mutex);
     if(RT_OK == ret)
     {
-      /*Sem posted*/
-      pthread_mutex_lock(&con->mutex);
-
       if(queue_entry.response)
       {
         if(queue_entry.response->header.flags & rtMessageFlags_Undeliverable)
