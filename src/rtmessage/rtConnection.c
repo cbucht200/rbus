@@ -1113,6 +1113,7 @@ rtConnection_SendRequestInternal(rtConnection con, uint8_t const* pReq, uint32_t
         else if(err == RT_NO_CONNECTION)
         {
           ret = err;
+          pthread_mutex_lock(&con->mutex);
           goto dequeue_and_continue;
         }
         else
@@ -1133,6 +1134,7 @@ rtConnection_SendRequestInternal(rtConnection con, uint8_t const* pReq, uint32_t
         if(queue_entry.response->header.flags & rtMessageFlags_Undeliverable)
         {
           rtMessageInfo_Release(queue_entry.response);
+          queue_entry.response = NULL;
 
           ret = RT_OBJECT_NO_LONGER_AVAILABLE;
         }
@@ -1152,6 +1154,12 @@ rtConnection_SendRequestInternal(rtConnection con, uint8_t const* pReq, uint32_t
 
 dequeue_and_continue:
     rtList_RemoveItem(con->pending_requests_list, listItem, NULL);
+    /* reply may have arrived after we stopped waiting; we still own it */
+    if(ret != RT_OK && queue_entry.response)
+    {
+      rtMessageInfo_Release(queue_entry.response);
+      queue_entry.response = NULL;
+    }
     pthread_mutex_unlock(&con->mutex);
     rtSemaphore_Destroy(queue_entry.sem);
 
